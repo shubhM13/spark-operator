@@ -73,12 +73,14 @@ func TestDynamicTLSConfigServedLeaf(t *testing.T) {
 	require.NotNil(t, leaf)
 	assert.Equal(t, "webhook.default.svc", leaf.Subject.CommonName)
 
-	// ServedLeaf returns the parsed currently-served DER, matching the leaf that
-	// GetCertificate hands to TLS clients.
+	// ServedLeaf returns the parsed currently-served DER, and *DynamicTLSConfig
+	// satisfies the interlock accessor the filesystem CA source depends on.
 	served, err := dynamicTLS.GetCertificate(nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, served.Certificate)
 	assert.Equal(t, served.Certificate[0], leaf.Raw)
+
+	var _ servedLeafAccessor = dynamicTLS
 }
 
 func TestDynamicTLSConfigReloadsAndRetainsLastKnownGood(t *testing.T) {

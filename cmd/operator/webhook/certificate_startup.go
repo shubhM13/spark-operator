@@ -43,9 +43,13 @@ func runCertificateStartup(
 	actions certificateStartupActions,
 ) error {
 	// The filesystem provider gets its serving cert/key from mounted files
-	// (dynamicServing), so it never syncs a secret or writes files. Publishing
-	// the caBundle for this provider is a later iteration; here it only serves.
+	// (dynamicServing), so it never syncs a secret or writes files. It only runs
+	// the CA reconcilers when the operator owns the caBundle; an external owner
+	// (including cert-manager's ca-injector) leaves it a no-op.
 	if options.provider == certificateProviderFilesystem {
+		if options.caBundleOwner == caBundleOwnerOperator {
+			return actions.setupCAReconcilers()
+		}
 		return nil
 	}
 
@@ -55,9 +59,9 @@ func runCertificateStartup(
 	if err := actions.writeFiles(); err != nil {
 		return err
 	}
-	// The self-signed provider mints and publishes its own CA, so it runs the
-	// reconcilers; cert-manager's ca-injector owns the caBundle, so it does not.
-	if options.provider == certificateProviderSelfSigned {
+	// self-signed owns the caBundle (owner=operator) and runs the reconcilers;
+	// cert-manager (owner=cert-manager) syncs and writes only.
+	if options.caBundleOwner == caBundleOwnerOperator {
 		return actions.setupCAReconcilers()
 	}
 	return nil

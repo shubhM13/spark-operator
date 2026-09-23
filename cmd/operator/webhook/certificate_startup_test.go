@@ -37,27 +37,47 @@ func TestNewStartCommandCertificateFlags(t *testing.T) {
 	waitTimeout, err := command.Flags().GetDuration("webhook-cert-wait-timeout")
 	require.NoError(t, err)
 	assert.Equal(t, 2*time.Minute, waitTimeout)
+
+	caBundleFile, err := command.Flags().GetString("webhook-ca-bundle-file")
+	require.NoError(t, err)
+	assert.Empty(t, caBundleFile)
+	caBundleSync, err := command.Flags().GetString("webhook-ca-bundle-sync")
+	require.NoError(t, err)
+	assert.Equal(t, "auto", caBundleSync)
+	caBundleSyncInterval, err := command.Flags().GetDuration("webhook-ca-bundle-sync-interval")
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, caBundleSyncInterval)
 }
 
 func TestRunCertificateStartup(t *testing.T) {
 	tests := []struct {
 		name       string
 		provider   certificateProvider
+		owner      caBundleOwner
 		wantEvents []string
 	}{
 		{
 			name:       "self signed syncs secret writes files and sets up reconcilers",
 			provider:   certificateProviderSelfSigned,
+			owner:      caBundleOwnerOperator,
 			wantEvents: []string{"sync:self-signed", "write", "reconcile-ca"},
 		},
 		{
 			name:       "cert manager syncs and writes only",
 			provider:   certificateProviderCertManager,
+			owner:      caBundleOwnerCertManager,
 			wantEvents: []string{"sync:cert-manager", "write"},
 		},
 		{
-			name:     "filesystem serves from files and does nothing else",
+			name:       "filesystem operator sets up reconcilers without secret or file work",
+			provider:   certificateProviderFilesystem,
+			owner:      caBundleOwnerOperator,
+			wantEvents: []string{"reconcile-ca"},
+		},
+		{
+			name:     "filesystem external does nothing",
 			provider: certificateProviderFilesystem,
+			owner:    caBundleOwnerExternal,
 		},
 	}
 
@@ -79,7 +99,7 @@ func TestRunCertificateStartup(t *testing.T) {
 				},
 			}
 
-			err := runCertificateStartup(context.Background(), certificateOptions{provider: tt.provider}, actions)
+			err := runCertificateStartup(context.Background(), certificateOptions{provider: tt.provider, caBundleOwner: tt.owner}, actions)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantEvents, events)
 		})
@@ -103,7 +123,7 @@ func TestRunCertificateStartupStopsAfterFailure(t *testing.T) {
 		},
 	}
 
-	err := runCertificateStartup(context.Background(), certificateOptions{provider: certificateProviderSelfSigned}, actions)
+	err := runCertificateStartup(context.Background(), certificateOptions{provider: certificateProviderSelfSigned, caBundleOwner: caBundleOwnerOperator}, actions)
 	require.ErrorIs(t, err, assert.AnError)
 	assert.Equal(t, []string{"sync"}, events)
 }

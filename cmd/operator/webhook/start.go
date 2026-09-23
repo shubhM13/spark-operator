@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -88,6 +89,9 @@ var (
 	webhookServiceNamespace        string
 	webhookCertProvider            string
 	webhookCertWaitTimeout         time.Duration
+	webhookCABundleFile            string
+	webhookCABundleSync            string
+	webhookCABundleSyncInterval    time.Duration
 
 	// Cert Manager
 	enableCertManager bool
@@ -155,6 +159,9 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().StringVar(&webhookServiceNamespace, "webhook-svc-namespace", "spark-webhook", "The name of the Service for the webhook server.")
 	command.Flags().StringVar(&webhookCertProvider, "webhook-cert-provider", string(certificateProviderSelfSigned), "The provider for the webhook server certificate. Valid values are self-signed, cert-manager, and filesystem.")
 	command.Flags().DurationVar(&webhookCertWaitTimeout, "webhook-cert-wait-timeout", 2*time.Minute, "Maximum time to wait for an initial filesystem certificate and key pair.")
+	command.Flags().StringVar(&webhookCABundleFile, "webhook-ca-bundle-file", "", "Path to the CA bundle file the operator publishes to the webhook configurations' caBundle when it owns trust (filesystem provider). Defaults to ca.crt under --webhook-cert-dir.")
+	command.Flags().StringVar(&webhookCABundleSync, "webhook-ca-bundle-sync", string(caBundleSyncModeAuto), "Who reconciles the webhook caBundle. Valid values are auto, enabled, and disabled. auto lets the certificate provider decide.")
+	command.Flags().DurationVar(&webhookCABundleSyncInterval, "webhook-ca-bundle-sync-interval", 10*time.Second, "Interval at which the operator re-reads the CA bundle file when it owns trust (filesystem provider).")
 	command.Flags().BoolVar(&enableResourceQuotaEnforcement, "enable-resource-quota-enforcement", false, "Whether to enable ResourceQuota enforcement for SparkApplication resources. Requires the webhook to be enabled.")
 
 	// Cert Manager
@@ -199,14 +206,17 @@ func start(providerExplicit bool) {
 	setupLog()
 
 	certOptions, err := resolveCertificateOptions(certificateOptionsInput{
-		provider:          webhookCertProvider,
-		providerExplicit:  providerExplicit,
-		enableCertManager: enableCertManager,
-		certDir:           webhookCertDir,
-		certName:          webhookCertName,
-		keyName:           webhookKeyName,
-		waitTimeout:       webhookCertWaitTimeout,
-		retryInterval:     filesystemCertificateRetryInterval,
+		provider:             webhookCertProvider,
+		providerExplicit:     providerExplicit,
+		enableCertManager:    enableCertManager,
+		certDir:              webhookCertDir,
+		certName:             webhookCertName,
+		keyName:              webhookKeyName,
+		waitTimeout:          webhookCertWaitTimeout,
+		retryInterval:        filesystemCertificateRetryInterval,
+		caBundleFile:         webhookCABundleFile,
+		caBundleSync:         webhookCABundleSync,
+		caBundleSyncInterval: webhookCABundleSyncInterval,
 	})
 	if err != nil {
 		logger.Error(err, "Failed to resolve certificate provider")
@@ -308,6 +318,34 @@ func start(providerExplicit bool) {
 		)
 	}
 
+	// caBundleSource feeds the reconcilers the trust bundle to publish. When the
+	// operator owns the caBundle in filesystem mode, it is a FilesystemCABundleSource
+	// running as a non-leader-elected manager runnable that reads the mounted CA
+	// file and signals each reconciler on change; otherwise it is the Provider.
+	var caBundleSource certificate.CABundleSource = certProvider
+	var mutatingCAEvents, validatingCAEvents <-chan event.GenericEvent
+	if certOptions.provider == certificateProviderFilesystem && certOptions.caBundleOwner == caBundleOwnerOperator {
+		filesystemCABundleSource, err := certificate.NewFilesystemCABundleSource(
+			ctx,
+			certOptions.caBundleFile,
+			certOptions.caBundleSyncInterval,
+			certOptions.waitTimeout,
+			certOptions.retryInterval,
+			dynamicServing,
+		)
+		if err != nil {
+			logger.Error(err, "Failed to initialize filesystem CA bundle source")
+			os.Exit(1)
+		}
+		if err := mgr.Add(filesystemCABundleSource); err != nil {
+			logger.Error(err, "Failed to register filesystem CA bundle source")
+			os.Exit(1)
+		}
+		caBundleSource = filesystemCABundleSource
+		mutatingCAEvents = filesystemCABundleSource.RegisterSink()
+		validatingCAEvents = filesystemCABundleSource.RegisterSink()
+	}
+
 	if err := runCertificateStartup(ctx, certOptions, certificateStartupActions{
 		syncSecret: func(ctx context.Context, _ certificateProvider) error {
 			return wait.ExponentialBackoffWithContext(
@@ -334,18 +372,26 @@ func start(providerExplicit bool) {
 			return certProvider.WriteFile(webhookCertDir, webhookCertName, webhookKeyName)
 		},
 		setupCAReconcilers: func() error {
-			if err := mutatingwebhookconfiguration.NewReconciler(
+			mutatingReconciler := mutatingwebhookconfiguration.NewReconciler(
 				mgr.GetClient(),
-				certProvider,
+				caBundleSource,
 				mutatingWebhookName,
-			).SetupWithManager(mgr, controller.Options{}); err != nil {
+			)
+			if mutatingCAEvents != nil {
+				mutatingReconciler = mutatingReconciler.WithCABundleEventChannel(mutatingCAEvents)
+			}
+			if err := mutatingReconciler.SetupWithManager(mgr, controller.Options{}); err != nil {
 				return err
 			}
-			return validatingwebhookconfiguration.NewReconciler(
+			validatingReconciler := validatingwebhookconfiguration.NewReconciler(
 				mgr.GetClient(),
-				certProvider,
+				caBundleSource,
 				validatingWebhookName,
-			).SetupWithManager(mgr, controller.Options{})
+			)
+			if validatingCAEvents != nil {
+				validatingReconciler = validatingReconciler.WithCABundleEventChannel(validatingCAEvents)
+			}
+			return validatingReconciler.SetupWithManager(mgr, controller.Options{})
 		},
 	}); err != nil {
 		logger.Error(err, "Failed to initialize certificate provider", "provider", certOptions.provider)
@@ -394,7 +440,17 @@ func start(providerExplicit bool) {
 		os.Exit(1)
 	}
 
-	if err := mgr.AddReadyzCheck("readyz", mgr.GetWebhookServer().StartedChecker()); err != nil {
+	readyzChecker := mgr.GetWebhookServer().StartedChecker()
+	if certOptions.provider == certificateProviderFilesystem && certOptions.caBundleOwner == caBundleOwnerOperator {
+		// The operator publishes the caBundle here, so readiness must reflect that
+		// both fail-closed admission objects actually carry it before this replica
+		// is declared ready. Other modes never read admission objects.
+		readyzChecker = allCheckers(
+			readyzChecker,
+			caBundleReadinessChecker(mgr.GetClient(), caBundleSource, mutatingWebhookName, validatingWebhookName),
+		)
+	}
+	if err := mgr.AddReadyzCheck("readyz", readyzChecker); err != nil {
 		logger.Error(err, "Failed to set up ready check")
 		os.Exit(1)
 	}
