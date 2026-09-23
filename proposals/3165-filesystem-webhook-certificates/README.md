@@ -21,6 +21,7 @@
   - [Risks and Mitigations](#risks-and-mitigations)
   - [Open Questions](#open-questions)
 - [Design Details](#design-details)
+  - [Iteration Plan](#iteration-plan)
   - [Configuration](#configuration)
   - [Helm and Kustomize](#helm-and-kustomize)
   - [Startup and Serving-Certificate Reload](#startup-and-serving-certificate-reload)
@@ -57,6 +58,13 @@ injector or declarative deployment system can be the sole `caBundle` owner.
 Existing self-signed and cert-manager installations remain unchanged by
 default.
 
+This work is delivered in two iterations. Iteration 1 (v1) ships the functional,
+opt-in provider with a minimal CA-validation floor; Iteration 2 (v2) adds semantic
+certificate hardening and a coordinated trust-overlap protocol for fully safe
+issuer and root rotation. The [Design Details](#design-details) describe the
+complete target; the [Iteration Plan](#iteration-plan) states which behavior each
+iteration delivers, and each design subsection is annotated accordingly.
+
 ![Proposed certificate architecture](webhook-certificate-architecture.svg)
 
 ## Motivation
@@ -89,16 +97,23 @@ Related work:
 
 ### Goals
 
-- Add an explicit, opt-in filesystem certificate provider.
-- Preserve the existing self-signed default and cert-manager compatibility.
-- Never access a certificate Secret in filesystem mode.
+Goals are tagged by the iteration that delivers them (see
+[Iteration Plan](#iteration-plan)):
+
+- Add an explicit, opt-in filesystem certificate provider. *(v1)*
+- Preserve the existing self-signed default and cert-manager compatibility. *(v1)*
+- Never access a certificate Secret in filesystem mode. *(v1)*
 - Validate the initial and replacement serving identity before accepting it.
-- Reload valid certificate renewals without restarting the pod.
-- Support one or more CA certificates for issuer overlap.
-- Give exactly one component ownership of admission `caBundle` fields.
-- Repair operator-owned CA drift after file or Kubernetes object changes.
-- Render provider-specific probes and least-privilege RBAC.
-- Define safe upgrade, root rotation, and rollback procedures.
+  *(v1 accepts a parseable, key-matched pair and applies a CA↔served-leaf
+  interlock; full semantic preflight — SAN, usage, issuer, chain, bounds — is v2.)*
+- Reload valid certificate renewals without restarting the pod. *(v1)*
+- Support one or more CA certificates for issuer overlap. *(v1 accepts and
+  publishes multi-certificate bundles; the overlap-safe rotation protocol is v2.)*
+- Give exactly one component ownership of admission `caBundle` fields. *(v1)*
+- Repair operator-owned CA drift after file or Kubernetes object changes. *(v1)*
+- Render provider-specific probes and least-privilege RBAC. *(RBAC gating v1; the
+  filesystem startup probe is v2.)*
+- Define safe upgrade, root rotation, and rollback procedures. *(v2)*
 
 ### Non-Goals
 
@@ -179,6 +194,14 @@ not expose a dynamic CA source independent of cainjector.
 
 ### Risks and Mitigations
 
+*Iteration: v1 delivers the last-known-good retention, the single-owner resolution,
+the bounded periodic poll, the every-replica-refresh / leader-only-write split, and
+compare-before-patch. The overlap-bundle mitigation for serving a new issuer before
+the API server trusts it, and the published-trust stabilization it depends on, are
+v2 — so in v1 the corresponding rows below are addressed only for leaf renewal under
+an unchanged, already-trusted issuer (see
+[Known v1 limitations](#known-v1-limitations)).*
+
 | Risk | Mitigation |
 |---|---|
 | A partial or invalid serving generation causes an outage | Validate before cache replacement and retain the last accepted pair |
@@ -228,6 +251,81 @@ mutually exclusive, and both remain disabled by default.
 
 ## Design Details
 
+The design below is the complete target. It is delivered in two iterations so a
+functional, opt-in path lands first and the semantic and multi-object-safety
+hardening follows. Each subsection is annotated with the iteration that delivers
+it.
+
+### Iteration Plan
+
+#### Iteration 1 (v1) — implemented, opt-in
+
+- **`filesystem` serving identity.** The webhook reads the serving chain and key
+  and hot-reloads renewals in place, without creating, reading, or copying a
+  Secret. Parsing and key-match use the Kubernetes apiserver
+  `dynamiccertificates` content/controller; a renewed pair is published
+  atomically.
+- **Operator-owned CA publication.** In `filesystem + auto/enabled` mode the
+  operator reads `ca.crt`, applies the v1 validation floor, and reconciles both
+  named admission configurations with compare-before-write, a targeted
+  strategic-merge patch keyed by webhook name, an optimistic lock, and a jittered
+  periodic safety reconcile. Publication is leader-elected; every replica refreshes
+  its own local trust.
+- **v1 CA validation floor (Option A).** A candidate bundle is accepted only when
+  it (1) parses to one or more PEM `CERTIFICATE` blocks and canonicalizes —
+  preserving input order and dropping exact-duplicate DER — and (2) the currently
+  served leaf verifies against a certificate pool built from the candidate
+  (CA↔served-leaf interlock). Any failure retains the last-known-good bundle and
+  retries on the next poll. This never publishes unparseable input and never
+  publishes a bundle that would reject the operator's own serving leaf.
+- **Readiness gate.** In `filesystem + operator` mode `readyz` stays not-ready
+  until both admission configurations carry the committed bundle.
+- **RBAC gating and multi-replica guard.** Admission `list`/`watch`/`get`/`patch`
+  permissions render only under operator ownership; the chart fails to render when
+  operator ownership is combined with more than one replica and leader election
+  disabled.
+
+#### Iteration 2 (v2) — designed here, deferred
+
+- **Semantic serving preflight.** SAN match against the webhook Service DNS name,
+  server-authentication usage, validity window, issuer, full chain validation
+  against the mounted CA, 1 MiB / 100-certificate read bounds, and mixed-pair
+  (projected-symlink-switch) rejection. v1 relies on the library's parse-and-match
+  only.
+- **Semantic CA hardening.** Reject private keys, unknown block types, trailing
+  data, malformed DER, and non-CA certificates (`IsCA`/BasicConstraints), and
+  verify intermediate chains. The v1 interlock is leaf-only against a roots pool
+  and therefore assumes the served leaf is issued directly by a CA present in the
+  bundle (for example, Madkub's roots-only `cacerts.pem`).
+- **Coordinated trust state machine.** A per-replica desired/published/served
+  tracker with `--webhook-ca-bundle-stabilization-interval`, so a replacement leaf
+  is accepted only against *published* trust and endpoints stay ready during
+  overlap.
+- **Overlap-safe rotation and migration.** The issuer/root rotation overlap
+  procedure, the compatibility-release migration and rollback sequence, the
+  matching webhook startup probe, the two Kustomize overlays, and the observability
+  metrics.
+
+#### Known v1 limitations
+
+Until v2 lands, v1 is safe only under the stated constraints. These are called out
+again in [Risks and Mitigations](#risks-and-mitigations) and [Drawbacks](#drawbacks):
+
+- Serving identity and CA publication advance independently, so a new-issuer leaf
+  can be served while the source and admission objects still carry the old CA. v1
+  is therefore safe for **leaf renewal under an unchanged issuer already trusted by
+  the published bundle**, not for issuer or root rotation.
+- During a safe trust expansion (old → old+new), every replica can become unready
+  before the leader publishes the combined bundle.
+- The interlock verifies only the served leaf against a roots pool; it cannot
+  bootstrap a leaf/intermediate/root chain when `ca.crt` contains roots only and
+  an intermediate is required.
+- Per-replica desired trust can diverge; after leader failover a stale replica can
+  roll the published bundle backward, and readiness byte-equality does not prevent
+  it.
+- Filesystem bootstrap can wait up to `--webhook-cert-wait-timeout` before the
+  health server starts, and v1 ships no matching webhook startup probe.
+
 ### Configuration
 
 The binary adds these flags:
@@ -241,9 +339,16 @@ The binary adds these flags:
 | `--webhook-ca-bundle-file` | Empty | Filesystem CA path; defaults to `<cert-dir>/ca.crt` in filesystem mode |
 | `--webhook-ca-bundle-sync` | `auto` | `auto`, `enabled`, or `disabled` |
 | `--webhook-ca-bundle-sync-interval` | `10s` | Successful filesystem refresh interval |
-| `--webhook-ca-bundle-stabilization-interval` | `20s` | Time both admission objects must match before new trust authorizes a replacement leaf |
+| `--webhook-ca-bundle-stabilization-interval` | `20s` | *(v2)* Time both admission objects must match before new trust authorizes a replacement leaf |
 | `--webhook-cert-wait-timeout` | `2m` | Maximum initial wait for filesystem material |
 | `--enable-cert-manager` | Existing `false` | Compatibility alias |
+
+*Iteration: v1 implements `--webhook-cert-provider`, `--webhook-cert-dir`,
+`--webhook-cert-name`, `--webhook-key-name`, `--webhook-ca-bundle-file`,
+`--webhook-ca-bundle-sync`, `--webhook-ca-bundle-sync-interval`, and
+`--webhook-cert-wait-timeout`. `--webhook-ca-bundle-stabilization-interval` and the
+published-trust tracker it feeds are deferred to v2, so the
+stabilization-vs-sync-interval validation applies only once v2 lands.*
 
 The command uses Cobra's `Flag.Changed` state to distinguish an omitted provider
 from an explicitly selected value:
@@ -305,7 +410,21 @@ readiness are explicit:
 - `webhook-filesystem-operator-ca`
 - `webhook-filesystem-external-ca`
 
+*Iteration: v1 renders `--webhook-cert-provider` and the `--webhook-ca-bundle-*`
+arguments, gates admission RBAC behind operator ownership, and enforces the
+multi-replica leader-election guard. The filesystem startup probe, the two
+Kustomize overlays, and the `caBundle.stabilizationInterval` / `caBundle.pem` /
+`admissionConfigurationAnnotations` values are v2.*
+
 ### Startup and Serving-Certificate Reload
+
+*Iteration: v1 performs the bounded startup wait and the parse/key-match/atomic-
+reload using the apiserver `dynamiccertificates` content and controller. The full
+preflight checklist below (SAN, validity, server-authentication usage, chain
+validation, and the 1 MiB / 100-certificate bounds), the mixed-pair rejection, and
+the published-trust replacement rule are v2; v1 accepts any parseable, key-matched
+pair and relies on the CA↔served-leaf interlock in
+[CA Bundle Reconciliation](#ca-bundle-reconciliation).*
 
 Filesystem delivery may be asynchronous. Startup retries transient file absence,
 permission errors, partial writes, and key mismatch until the bounded timeout.
@@ -343,6 +462,13 @@ metrics listener retains its existing certificate-selection behavior.
 
 ### CA Bundle Reconciliation
 
+*Iteration: v1 implements the candidate/commit contract with the Option-A floor —
+steps 1, 3, 4, and 5, plus the parse-≥1-`CERTIFICATE` half of step 2. The full
+rejection set in step 2 (private keys, unknown block types, trailing data,
+malformed DER, non-CA certificates) and the published-trust advance in the final
+paragraph are v2. The v1 interlock in step 4 verifies the served leaf against a
+roots pool built from the candidate, so it assumes a directly-issued leaf.*
+
 CA parsing and publication use a candidate/commit contract:
 
 1. Read and parse a candidate without changing the last-known-good value.
@@ -378,6 +504,13 @@ Readiness and replacement-leaf validation continue using the previous published
 trust while a newer desired bundle converges.
 
 ### Rotation and Migration
+
+*Iteration: leaf renewal under an unchanged, already-trusted issuer is supported
+in v1. The issuer-rotation overlap procedure, the compatibility-release migration
+and rollback sequence, and the `update`→`patch` two-release RBAC transition all
+depend on the published-trust tracker and stabilization interval and are therefore
+v2. In v1, issuer or root rotation is not safe (see
+[Known v1 limitations](#known-v1-limitations)).*
 
 Leaf renewal under an unchanged issuer is safe when the external owner publishes
 the new certificate and key as one generation. Replicas may briefly serve old
@@ -417,6 +550,11 @@ restart self-minting and overwrite prepared trust.
 
 ### Readiness
 
+*Iteration: v1 implements the bootstrap-convergence gate (first paragraph below).
+The published-trust refinement (second paragraph) that keeps endpoints ready
+during overlap is v2; in v1 readiness compares against the committed desired
+bundle directly.*
+
 The current server-started check does not prove that the API server trusts the
 webhook. For explicitly selected filesystem mode with operator-owned CA sync,
 readiness remains false until both admission configurations contain the
@@ -445,15 +583,19 @@ Permissions are rendered from resolved responsibilities:
 | Operator CA publication | List/watch with exact-name field selectors; get and patch the named admission objects |
 | External CA publication | No admission read or write permission for certificate management |
 
-The existing reconcilers use full `update`. Migration to targeted `patch` uses a
-two-release RBAC sequence: a compatibility release grants `update` and `patch`,
-then the following release removes `update`.
+The existing reconcilers use full `update`. v1 adds `patch` to the operator role
+(the reconcilers apply a strategic-merge patch) while retaining `update`. Dropping
+`update` via the two-release RBAC sequence — a compatibility release granting both,
+then a following release removing `update` — is a v2 migration step.
 
 Operator-owned CA publication requires leader election when the chart renders
 more than one webhook replica. The chart rejects multiple replicas with resolved
 operator ownership and leader election disabled.
 
 ### Observability
+
+*Iteration: v1 logs the resolved provider and CA owner and logs CA commits without
+PEM contents. The fixed-cardinality metrics below are v2.*
 
 Startup logs the resolved provider and CA owner. Rotation logs include only a
 short certificate or CA digest, certificate count, validity metadata, and target
@@ -474,6 +616,38 @@ metric labels.
 
 [x] I understand the owners of the involved components may require updates to
 existing tests before implementation.
+
+*Iteration: the coverage delivered in v1 is listed under
+[Iteration 1 (v1) coverage](#iteration-1-v1-coverage). The prerequisite, unit,
+integration, and E2E sections that follow are the complete v2 target; items not
+listed as v1 coverage are deferred to v2.*
+
+#### Iteration 1 (v1) coverage
+
+Implemented and green in v1:
+
+- **Unit.** Options/ownership resolution (owner matrix, invalid combinations,
+  duration and sync-mode validation); filesystem CA source floor A (parse ≥1
+  certificate, order-preserving dedupe, interlock accept when the served leaf
+  chains to the candidate and reject when it does not, last-known-good retention
+  on bad input, broadcast only on change, `NeedLeaderElection()==false`); dynamic
+  serving acquire/reload; both reconcilers via a fake `CABundleSource` (drift,
+  no-op, targeted patch); readiness bootstrap-not-ready→ready.
+- **Integration (envtest).** A real API server with both named admission
+  configurations and both reconcilers wired through a manager in
+  `filesystem + operator` mode: both configurations converge to the committed
+  bundle; `readyz` flips false→true on convergence; rotating the CA file (adding a
+  second root) converges both configurations; a corrupt file retains the
+  last-known-good bundle with no re-patch (stable resource versions); a follower
+  source refreshes its local trust without publishing.
+- **Chart/Kustomize.** helm-unittest over the rendered provider and
+  `--webhook-ca-bundle-*` arguments, the RBAC ownership gating, and the
+  multi-replica leader-election guard; `drift-check`; the Kustomize build test.
+
+The v1 envtest proves **admission-object caBundle convergence and readiness**. It
+does not start a webhook server, perform a verified TLS or admission request,
+rotate the serving issuer, or exercise real leader-election failover; those are
+part of the v2 integration and E2E target below.
 
 #### Prerequisite testing updates
 
@@ -526,12 +700,16 @@ reduced to keep CI cost bounded.
 
 ### Graduation Criteria
 
+*Iteration: v1 targets the first three Alpha criteria. The E2E leaf-renewal and
+issuer-overlap transition require the v2 semantic preflight and overlap protocol
+and complete Alpha in v2.*
+
 #### Alpha
 
-- Provider and ownership APIs are accepted.
-- Unit, integration, Helm, and Kustomize tests pass.
-- Default behavior and rendered manifests are unchanged.
-- At least one E2E leaf renewal and issuer-overlap transition pass.
+- Provider and ownership APIs are accepted. *(v1)*
+- Unit, integration, Helm, and Kustomize tests pass. *(v1, at the coverage above)*
+- Default behavior and rendered manifests are unchanged. *(v1)*
+- At least one E2E leaf renewal and issuer-overlap transition pass. *(v2)*
 
 #### Beta
 
@@ -552,6 +730,12 @@ reduced to keep CI cost bounded.
 - **2026-09-13** - Tracking issue
   [#3165](https://github.com/kubeflow/spark-operator/issues/3165) opened and KEP
   drafted.
+- **2026-09-23** - Split delivery into Iteration 1 (v1) and Iteration 2 (v2);
+  annotated the design with per-iteration scope. v1 (functional filesystem serving
+  + operator-owned CA publication with the Option-A validation floor and
+  convergence readiness) implemented and proposed as stacked PRs; v2 semantic
+  hardening and the coordinated trust-overlap protocol remain designed here and
+  deferred.
 
 ## Drawbacks
 
@@ -567,6 +751,15 @@ admission trust are identical without violating least privilege.
 Finally, strict validation can reject certificate generations that an existing
 downstream patch might have attempted to serve. That is intentional for a
 fail-closed admission endpoint, but it requires clear diagnostics.
+
+Delivering in two iterations means v1 ships with the
+[Known v1 limitations](#known-v1-limitations): serving identity and CA publication
+advance independently, trust expansion can leave replicas transiently unready, the
+interlock is leaf-only, a stale replica can roll the bundle backward after
+failover, and there is no filesystem startup probe yet. v1 is opt-in and safe for
+leaf renewal under an unchanged, already-trusted issuer; issuer and root rotation
+require the v2 protocol. These are accepted deliberately to land a reviewable,
+functional path before the larger hardening change.
 
 ## Alternatives
 
